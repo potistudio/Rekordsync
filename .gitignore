@@ -1,59 +1,18 @@
-# OS files
+# macOS dummy file
 .DS_Store
-Thumbs.db
-Desktop.ini
-
-# Editors and IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
 
 # Node.js dependencies
 node_modules/
-.pnpm-store/
 
 # Build outputs
-# vite.config.ts の outDir は dist-web のため dist/ だけでは不足する
-dist/
+# vite.config.ts の outDir
 dist-web/
-.vite/
 
-# TypeScript
-*.tsbuildinfo
+# Vite が設定ファイルの読み込み時に生成する一時ファイル
 vite.config.ts.timestamp-*
-
-# Rust build outputs
-# desktop/.gitignore の /target/ と重複するが、将来のクレート追加に備えてルートでも防御する
-target/
-
-# Tauri bundle outputs
-# desktop/binaries/ の sidecar バイナリ (*.exe) は追跡対象のため *.exe は除外しない
-*.AppImage
-*.dmg
-*.msi
-*.nsis.zip
-*.deb
-
-# Merge leftovers
-*.orig
-*.rej
 
 # Logs
 *.log
-logs/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# Test results and coverage
-.vitest/
-coverage/
-.nyc_output/
-test-results/
-playwright-report/
 
 # Environment variables
 .env
