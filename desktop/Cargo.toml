@@ -1,0 +1,31 @@
+[package]
+name = "rekordsync"
+version = "0.1.0"
+description = "Rekordbox のプレイリスト・楽曲・キュー・タグを .rsync パッケージ経由で同期する GUI"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+anyhow = "1"
+# master.db は SQLCipher で暗号化されている。OpenSSL もソースからビルドして同梱する
+# （Windows ではビルドに Strawberry Perl 等のネイティブ Perl が必要）。
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+flate2 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

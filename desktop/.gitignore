@@ -1,0 +1,5 @@
+# Rust artifacts
+target/
+
+# Tauri artifacts
+/gen/schemas

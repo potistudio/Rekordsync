@@ -4,20 +4,16 @@
 # Node.js dependencies
 node_modules/
 
-# Build outputs
-# vite.config.ts の outDir
+# Artifacts
 dist-web/
-
-# Vite が設定ファイルの読み込み時に生成する一時ファイル
 vite.config.ts.timestamp-*
 
 # Logs
 *.log
 
-# Environment variables
+# Secrets
 .env
-.env.local
-.env.*.local
+.env.*
 !.env.example
 
 # Personal references
