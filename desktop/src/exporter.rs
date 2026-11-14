@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::models::{CueData, Package, PlaylistData, TrackData};
+use crate::models::{CueData, Package, PlaylistData, StreamData, TrackData};
 use crate::package::{write_package, AnalysisPaths};
 use crate::rekordbox::{anlz, non_empty, ContentRow, PlaylistRow, RekordboxDb};
 use crate::task::Task;
@@ -114,6 +114,11 @@ pub fn content_to_data(db: &RekordboxDb, content: &ContentRow) -> Result<TrackDa
 		my_tags: db.my_tag_names_of(&content.id)?,
 		analysis: BTreeMap::new(),
 		artwork: None,
+		stream: content.stream_uri().map(|uri| StreamData {
+			uri: uri.to_string(),
+			file_type: content.file_type.unwrap_or(0),
+			ext_info: non_empty(&content.ext_info).map(str::to_string),
+		}),
 	})
 }
 

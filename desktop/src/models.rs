@@ -180,6 +180,26 @@ pub struct TrackData {
 	/// アートワーク画像のパッケージ zip 内の相対パス（無ければ `None`）。
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub artwork: Option<String>,
+	/// ファイルを持たないストリーミング楽曲の参照。値がある楽曲は `file` が空でも欠落として扱わない。
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stream: Option<StreamData>,
+}
+
+/// ストリーミング楽曲（Apple Music 等）を取り込み先で再生するための `DjmdContent` の値。
+///
+/// 楽曲の実体は配信サービス側にあり、取り込み先の Rekordbox は同じサービスへの
+/// ログインを前提にこの参照から再生する。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamData {
+	/// `DjmdContent.FolderPath`。例: `apple-music:tracks:972852653`
+	#[serde(default, deserialize_with = "lenient_string")]
+	pub uri: String,
+	/// `DjmdContent.FileType`。Apple Music は 26。
+	#[serde(default, deserialize_with = "lenient_i64")]
+	pub file_type: i64,
+	/// `DjmdContent.ExtInfo`（JSON 文字列）。
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub ext_info: Option<String>,
 }
 
 /// プレイリスト（またはフォルダ）1 件分。

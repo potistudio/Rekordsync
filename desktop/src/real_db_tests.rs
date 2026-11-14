@@ -25,7 +25,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::exporter::{anlz_paths_of, artwork_path_of, collect_playlist_tree, content_to_data, export_playlists};
 use crate::importer::{import_package, ImportOptions};
-use crate::models::Package;
+use crate::models::{Package, TrackData};
 use crate::rekordbox::{locate_database, RekordboxDb};
 use crate::task::Task;
 
@@ -106,11 +106,17 @@ fn read_matches_python() {
 
 /// パッケージ内の楽曲 UUID を書き換えたコピーを作る（コピー先 DB で「新規の曲」として扱わせるため）。
 fn rewrite_uuids(src: &Path, dest: &Path) -> Package {
+	rewrite_package(src, dest, |_| {})
+}
+
+/// `rewrite_uuids` に加え、楽曲ごとに `edit` を適用したコピーを作る。
+fn rewrite_package(src: &Path, dest: &Path, edit: impl Fn(&mut TrackData)) -> Package {
 	let mut zip = ZipArchive::new(BufReader::new(File::open(src).unwrap())).unwrap();
 	let mut package: Package = serde_json::from_reader(zip.by_name(crate::config::MANIFEST_NAME).unwrap()).unwrap();
 	let map = |u: &str| format!("rstest-{u}");
 	for t in &mut package.tracks {
 		t.uuid = map(&t.uuid);
+		edit(t);
 	}
 	for p in &mut package.playlists {
 		p.track_uuids = p.track_uuids.iter().map(|u| map(u)).collect();
@@ -224,5 +230,114 @@ fn export_then_import_into_copy() {
 	assert_eq!(r2.tracks_added, 0);
 	assert_eq!(r2.tracks_reused, with_files);
 	assert_eq!(r2.playlists_merged, selected.len());
+	drop(db);
+}
+
+/// ストリーミング楽曲（Apple Music 等）を含むプレイリストを書き出し → 取り込み（DB のコピーへ）する。
+///
+/// 作業フォルダの `stream/` に、書き出したパッケージと取り込み先 DB のコピーを残す。
+#[test]
+#[ignore]
+fn stream_tracks_export_then_import_into_copy() {
+	let work = env_dir("REKORDSYNC_TEST_WORK").join("stream");
+	std::fs::create_dir_all(&work).unwrap();
+
+	// ストリーミング楽曲を収録した通常のプレイリストのうち、曲数が最少のものを選ぶ。
+	let db = real_db();
+	let songs = db.playlist_track_uuids().unwrap();
+	let is_stream = |uuid: &String| {
+		db.find_content_by_uuid(uuid)
+			.unwrap()
+			.is_some_and(|c| c.stream_uri().is_some())
+	};
+	let selected = db
+		.playlists()
+		.unwrap()
+		.into_iter()
+		.filter(|p| p.attribute == 0)
+		.filter_map(|p| songs.get(&p.id).map(|s| (p, s)))
+		.filter(|(_, s)| s.iter().any(is_stream))
+		.min_by_key(|(_, s)| s.len())
+		.map(|(p, _)| p.uuid)
+		.expect("ストリーミング楽曲を含むプレイリストがありません");
+
+	let exported = work.join("export.rsync");
+	let package = export_playlists(&db, &[selected.clone()], &exported, &Task::silent()).unwrap();
+	let streams: Vec<&TrackData> = package.tracks.iter().filter(|t| t.stream.is_some()).collect();
+	assert!(!streams.is_empty());
+	for t in &streams {
+		let s = t.stream.as_ref().unwrap();
+		let src = db.find_content_by_uuid(&t.uuid).unwrap().unwrap();
+		assert_eq!(Some(s.uri.as_str()), src.folder_path.as_deref());
+		assert_eq!(Some(s.file_type), src.file_type);
+		assert_eq!(s.ext_info, src.ext_info);
+		assert!(t.file.is_empty(), "ストリーミング楽曲にファイルが格納されています");
+	}
+	drop(db);
+
+	let db_path = copy_db(&work.join("db"));
+	let mut db = RekordboxDb::open(&db_path).unwrap();
+	db.set_require_closed(false);
+	let options = ImportOptions {
+		extract_dir: work.join("music"),
+		conflict_policy: "rename".into(),
+		import_cues: true,
+		import_tags: true,
+		import_analysis: true,
+		import_artwork: true,
+	};
+	let _ = std::fs::remove_dir_all(&options.extract_dir);
+	let all: HashSet<String> = HashSet::from([selected]);
+
+	// 1 回目: UUID だけを書き換える。取り込み先に同じ URI の楽曲があるため再利用する。
+	let reuse_pkg = work.join("reuse.rsync");
+	rewrite_uuids(&exported, &reuse_pkg);
+	let r1 = import_package(&mut db, &reuse_pkg, &options, Some(&all), &Task::silent()).unwrap();
+	eprintln!("再利用:\n{}\n{:?}", r1.summary(), r1.warnings);
+	assert!(r1.tracks_reused >= streams.len());
+	assert!(
+		r1.warnings.iter().all(|w| w.contains("ファイル欠落")),
+		"{:?}",
+		r1.warnings
+	);
+
+	// 2 回目: URI も書き換え、取り込み先に存在しないストリーミング楽曲として新規に追加させる。
+	let new_pkg = work.join("new.rsync");
+	let package = rewrite_package(&exported, &new_pkg, |t| {
+		if let Some(s) = t.stream.as_mut() {
+			s.uri = format!("{}-rstest", s.uri);
+		}
+	});
+	let r2 = import_package(&mut db, &new_pkg, &options, Some(&all), &Task::silent()).unwrap();
+	eprintln!("新規:\n{}\n{:?}", r2.summary(), r2.warnings);
+	assert!(r2.tracks_added >= streams.len());
+	assert!(
+		r2.warnings.iter().all(|w| w.contains("ファイル欠落")),
+		"{:?}",
+		r2.warnings
+	);
+	let created = db
+		.find_playlist_by_name(&format!("{} (3)", package.playlists[0].name))
+		.unwrap()
+		.expect("取り込んだプレイリストがありません");
+	let members = db.playlist_content_ids(&created.id).unwrap();
+	for t in package.tracks.iter().filter(|t| t.stream.is_some()) {
+		let s = t.stream.as_ref().unwrap();
+		let row = db
+			.find_content_by_stream_uri(&s.uri)
+			.unwrap()
+			.expect("ストリーミング楽曲が追加されていません");
+		assert_eq!(row.file_type, Some(s.file_type));
+		assert_eq!(row.ext_info, s.ext_info);
+		assert_eq!(row.stream_uri(), Some(s.uri.as_str()));
+		assert!(members.contains(&row.id), "プレイリストに追加されていません: {}", s.uri);
+		assert_eq!(db.cues_of(&row.id).unwrap().len(), t.cues.len());
+		if t.analysis.contains_key("DAT") {
+			let dat = db.share_path(row.analysis_data_path.as_deref().unwrap());
+			let ppth = crate::rekordbox::anlz::read_ppth(&std::fs::read(dat).unwrap()).unwrap();
+			let original = s.uri.trim_end_matches("-rstest");
+			assert!(ppth.ends_with(original), "PPTH が書き出し元と違います: {ppth}");
+		}
+	}
 	drop(db);
 }

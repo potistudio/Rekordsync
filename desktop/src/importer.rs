@@ -8,7 +8,7 @@ use rusqlite::types::Value;
 use serde::Serialize;
 
 use crate::config;
-use crate::models::{PlaylistData, TrackData};
+use crate::models::{PlaylistData, StreamData, TrackData};
 use crate::package::PackageReader;
 use crate::rekordbox::{anlz, non_empty, ContentRow, CueRow, PlaylistRow, RekordboxDb, Table};
 use crate::task::Task;
@@ -170,15 +170,27 @@ fn import_track(
 	uuid_to_content: &mut HashMap<String, String>,
 	result: &mut ImportResult,
 ) -> Result<()> {
-	let Some(file_path) = reader.extract_track(track, &options.extract_dir)? else {
-		result.tracks_failed += 1;
-		result
-			.warnings
-			.push(format!("ファイル欠落のため取り込めません: {}", track.file_name));
-		return Ok(());
+	let extracted;
+	let source = match track.stream.as_ref().filter(|s| !s.uri.is_empty()) {
+		Some(stream) => TrackSource::Stream(stream),
+		None => {
+			let Some(path) = reader.extract_track(track, &options.extract_dir)? else {
+				result.tracks_failed += 1;
+				result
+					.warnings
+					.push(format!("ファイル欠落のため取り込めません: {}", track.file_name));
+				return Ok(());
+			};
+			extracted = path;
+			TrackSource::File(&extracted)
+		}
 	};
 
-	let existing = match db.find_content_by_path(&file_path)? {
+	let by_location = match source {
+		TrackSource::File(path) => db.find_content_by_path(path)?,
+		TrackSource::Stream(stream) => db.find_content_by_stream_uri(&stream.uri)?,
+	};
+	let existing = match by_location {
 		Some(c) => Some(c),
 		None => db.find_content_by_uuid(&track.uuid)?,
 	};
@@ -188,7 +200,7 @@ fn import_track(
 			c
 		}
 		None => {
-			let id = add_track(db, &file_path, track, options)?;
+			let id = add_track(db, source, track, options)?;
 			result.tracks_added += 1;
 			db.find_content_by_id(&id)?
 				.ok_or_else(|| anyhow::anyhow!("追加した楽曲を読み直せません"))?
@@ -205,7 +217,7 @@ fn import_track(
 			if files.is_empty() {
 				return Ok(false);
 			}
-			import_analysis(db, &content, &files, &file_path, track.analysed)
+			import_analysis(db, &content, &files, source, track.analysed)
 		})();
 		match outcome {
 			Ok(true) => result.analysis_imported += 1,
@@ -243,8 +255,17 @@ fn import_track(
 	Ok(())
 }
 
+/// 取り込み先 DB での楽曲の実体の場所。
+#[derive(Clone, Copy)]
+enum TrackSource<'a> {
+	/// 展開先フォルダに書き出した楽曲ファイル。
+	File(&'a Path),
+	/// 配信サービス上の楽曲。ファイルは展開しない。
+	Stream(&'a StreamData),
+}
+
 /// 楽曲を DB に追加し、メタデータ・キュー・タグを設定する。
-fn add_track(db: &mut RekordboxDb, file_path: &Path, track: &TrackData, options: &ImportOptions) -> Result<String> {
+fn add_track(db: &mut RekordboxDb, source: TrackSource, track: &TrackData, options: &ImportOptions) -> Result<String> {
 	let int = |v: Option<i64>| v.map(Value::Integer);
 	let mut extra: Vec<(&'static str, Value)> = Vec::new();
 	if let Some(t) = track.title.as_deref().filter(|t| !t.is_empty()) {
@@ -269,7 +290,15 @@ fn add_track(db: &mut RekordboxDb, file_path: &Path, track: &TrackData, options:
 			extra.push((name, v));
 		}
 	}
-	let id = db.add_content(file_path, extra)?;
+	let id = match source {
+		TrackSource::File(path) => db.add_content(path, extra)?,
+		TrackSource::Stream(stream) => {
+			if let Some(ext) = stream.ext_info.as_deref().filter(|e| !e.is_empty()) {
+				extra.push(("ExtInfo", Value::Text(ext.to_string())));
+			}
+			db.add_stream_content(&stream.uri, stream.file_type, extra)?
+		}
+	};
 
 	// アーティスト／ジャンル／アルバムを名前から解決して紐づける。
 	// 失敗は致命ではないので、以降の紐づけを諦めるだけにする（Python 版と同じ）。
@@ -326,12 +355,12 @@ fn new_share_dir(db: &RekordboxDb, kind: &str) -> Result<(String, PathBuf)> {
 /// 解析（ANLZ）ファイルをローカルの share フォルダへ配置し、楽曲に紐づける。
 ///
 /// `DAT` が無い場合は `AnalysisDataPath` を作れないため何もせず `false` を返す。
-/// ANLZ 内の楽曲パス（PPTH）も新しい楽曲の場所に書き換える。
+/// ファイルの楽曲は、ANLZ 内の楽曲パス（PPTH）も新しい楽曲の場所に書き換える。
 fn import_analysis(
 	db: &mut RekordboxDb,
 	content: &ContentRow,
 	files: &BTreeMap<String, PathBuf>,
-	audio_path: &Path,
+	source: TrackSource,
 	analysed: Option<i64>,
 ) -> Result<bool> {
 	if !files.get("DAT").is_some_and(|p| p.is_file()) {
@@ -352,6 +381,11 @@ fn import_analysis(
 	let dat_name = config::anlz_file_name("DAT").unwrap();
 	db.mark_analysed(content, format!("/{rel_dir}/{dat_name}"), analysed)?;
 
+	// ストリーミング楽曲の PPTH は環境に依存しない URI（例: `?/apple-music:tracks:<ID>`）のため、
+	// 書き出し元の値を保持する。
+	let TrackSource::File(audio_path) = source else {
+		return Ok(true);
+	};
 	// ANLZ 内の楽曲パス（PPTH）を、取り込み先の実ファイルに合わせて更新する。
 	// 失敗しても解析データ自体は有効なので致命ではない。
 	let new_audio = audio_path.to_string_lossy().replace('\\', "/");

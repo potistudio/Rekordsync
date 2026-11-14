@@ -86,6 +86,27 @@ pub struct ContentRow {
 	pub analysis_updated: Option<String>,
 	pub image_path: Option<String>,
 	pub track_info_updated: Option<String>,
+	pub file_type: Option<i64>,
+	/// ストリーミング楽曲のカタログ参照（JSON 文字列）。ローカルファイルの楽曲では `"null"`。
+	pub ext_info: Option<String>,
+}
+
+impl ContentRow {
+	/// ファイルを持たないストリーミング楽曲の `FolderPath`。ローカルファイルの楽曲では `None`。
+	///
+	/// Rekordbox はストリーミング楽曲の `FolderPath` に `apple-music:tracks:972852653` のような
+	/// URI を保持する。2 文字以上の URI スキームで始まる値を URI とみなし、`C:\...` のような
+	/// ドライブ文字付きのパスと区別する。
+	pub fn stream_uri(&self) -> Option<&str> {
+		let path = non_empty(&self.folder_path)?;
+		let (scheme, _) = path.split_once(':')?;
+		let is_scheme = scheme.len() >= 2
+			&& scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+			&& scheme
+				.chars()
+				.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+		is_scheme.then_some(path)
+	}
 }
 
 /// `djmdCue` の 1 行（本アプリで使う列）。
@@ -105,7 +126,8 @@ const CONTENT_SELECT: &str = "SELECT c.ID, c.UUID, c.FolderPath, c.FileNameL, c.
     ar.Name, al.Name, g.Name, k.ScaleName, co.Commnt, \
     c.BPM, c.Length, c.Rating, c.Commnt, c.ReleaseYear, c.TrackNo, c.FileSize, \
     c.Analysed, c.SampleRate, c.BitRate, c.BitDepth, \
-    c.AnalysisDataPath, c.AnalysisUpdated, c.ImagePath, c.TrackInfoUpdated \
+    c.AnalysisDataPath, c.AnalysisUpdated, c.ImagePath, c.TrackInfoUpdated, \
+    c.FileType, c.ExtInfo \
     FROM djmdContent c \
     LEFT JOIN djmdArtist ar ON ar.ID = c.ArtistID \
     LEFT JOIN djmdAlbum al ON al.ID = c.AlbumID \
@@ -347,6 +369,8 @@ impl RekordboxDb {
 			analysis_updated: r.text(22)?,
 			image_path: r.text(23)?,
 			track_info_updated: r.text(24)?,
+			file_type: r.int(25)?,
+			ext_info: r.text(26)?,
 		})
 	}
 
@@ -368,6 +392,13 @@ impl RekordboxDb {
 	/// `FolderPath` が一致する楽曲。
 	pub fn find_content_by_path(&self, path: &Path) -> Result<Option<ContentRow>> {
 		self.find_content("FolderPath", &native_path_string(path))
+	}
+
+	/// `FolderPath` が `uri` と一致するストリーミング楽曲。
+	///
+	/// `uri` はパスではないため、区切り文字を変換する `find_content_by_path` を経由しない。
+	pub fn find_content_by_stream_uri(&self, uri: &str) -> Result<Option<ContentRow>> {
+		self.find_content("FolderPath", uri)
 	}
 
 	/// 楽曲のキュー（メモリーキュー・ホットキュー・ループ）。
@@ -582,18 +613,51 @@ impl RekordboxDb {
 	/// 楽曲を追加する（pyrekordbox `add_content` 相当）。`extra` は追加で設定する列。
 	pub fn add_content(&mut self, path: &Path, extra: Vec<(&'static str, Value)>) -> Result<String> {
 		let path_string = native_path_string(path);
+		let file_type = file_type_of(path)?;
+		let file_name = path
+			.file_name()
+			.map(|n| n.to_string_lossy().into_owned())
+			.unwrap_or_default();
+		let file_size = std::fs::metadata(path)
+			.with_context(|| format!("楽曲ファイルを読めません: {}", path.display()))?
+			.len() as i64;
+		let file_id = self.generate_unused_id(Table::Content, "rb_file_id")?;
+		self.insert_content(path_string, file_name, file_size, file_type, file_id, extra)
+	}
+
+	/// ファイルを持たないストリーミング楽曲を追加する。
+	///
+	/// Rekordbox が登録するストリーミング楽曲の行と同じく、`FolderPath` と `FileNameL` に
+	/// `uri` を、`FileSize` と `rb_file_id` に 0 を設定する。`FileType` と `ExtInfo` は
+	/// 再生時のサービス判定とカタログ参照に使われるため、元の行の値を `extra` で渡す。
+	pub fn add_stream_content(
+		&mut self,
+		uri: &str,
+		file_type: i64,
+		extra: Vec<(&'static str, Value)>,
+	) -> Result<String> {
+		self.insert_content(uri.to_string(), uri.to_string(), 0, file_type, "0".into(), extra)
+	}
+
+	fn insert_content(
+		&mut self,
+		folder_path: String,
+		file_name: String,
+		file_size: i64,
+		file_type: i64,
+		file_id: String,
+		extra: Vec<(&'static str, Value)>,
+	) -> Result<String> {
 		let exists: bool = self.conn.query_row(
 			"SELECT EXISTS(SELECT 1 FROM djmdContent WHERE FolderPath = ?1)",
-			[&path_string],
+			[&folder_path],
 			|r| r.get(0),
 		)?;
 		if exists {
-			bail!("同じパスの楽曲が既に登録されています: {path_string}");
+			bail!("同じパスの楽曲が既に登録されています: {folder_path}");
 		}
-		let file_type = file_type_of(path)?;
 
 		let id = self.generate_unused_id(Table::Content, "ID")?;
-		let file_id = self.generate_unused_id(Table::Content, "rb_file_id")?;
 		let content_link: Option<i64> = self
 			.conn
 			.query_row("SELECT rb_local_usn FROM djmdMenuItems WHERE Name = 'TRACK'", [], |r| {
@@ -610,13 +674,6 @@ impl RekordboxDb {
 			})
 			.context("djmdDevice が空です")?;
 		let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-		let file_name = path
-			.file_name()
-			.map(|n| n.to_string_lossy().into_owned())
-			.unwrap_or_default();
-		let file_size = std::fs::metadata(path)
-			.with_context(|| format!("楽曲ファイルを読めません: {}", path.display()))?
-			.len() as i64;
 
 		let opt = |v: Option<String>| v.map_or(Value::Null, Value::Text);
 		let mut cols: Vec<(&'static str, Value)> = vec![
@@ -627,7 +684,7 @@ impl RekordboxDb {
 			("FileNameL", Value::Text(file_name)),
 			("FileSize", Value::Integer(file_size)),
 			("FileType", Value::Integer(file_type)),
-			("FolderPath", Value::Text(path_string)),
+			("FolderPath", Value::Text(folder_path)),
 			("HotCueAutoLoad", Value::Text("on".into())),
 			("MasterDBID", opt(master_db_id)),
 			("MasterSongID", Value::Text(id.clone())),
@@ -830,5 +887,30 @@ fn value_to_text(v: Value) -> Option<String> {
 impl Drop for RekordboxDb {
 	fn drop(&mut self) {
 		self.rollback();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn row(folder_path: &str) -> ContentRow {
+		ContentRow {
+			folder_path: Some(folder_path.to_string()),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn stream_uri_detects_uri_scheme() {
+		assert_eq!(
+			row("apple-music:tracks:972852653").stream_uri(),
+			Some("apple-music:tracks:972852653")
+		);
+		assert_eq!(row(r"C:\Users\a\Music\x.mp3").stream_uri(), None);
+		assert_eq!(row("C:/Users/a/Music/x.mp3").stream_uri(), None);
+		assert_eq!(row("/Users/a/Music/x:y.mp3").stream_uri(), None);
+		assert_eq!(row("").stream_uri(), None);
+		assert_eq!(ContentRow::default().stream_uri(), None);
 	}
 }
