@@ -613,6 +613,7 @@ impl RekordboxDb {
 	/// 楽曲を追加する（pyrekordbox `add_content` 相当）。`extra` は追加で設定する列。
 	pub fn add_content(&mut self, path: &Path, extra: Vec<(&'static str, Value)>) -> Result<String> {
 		let path_string = native_path_string(path);
+		self.ensure_new_folder_path(&path_string)?;
 		let file_type = file_type_of(path)?;
 		let file_name = path
 			.file_name()
@@ -636,7 +637,24 @@ impl RekordboxDb {
 		file_type: i64,
 		extra: Vec<(&'static str, Value)>,
 	) -> Result<String> {
+		self.ensure_new_folder_path(uri)?;
+		// FileType 0 は Rekordbox で無効な形式として扱われ、再生できない行になる。
+		if file_type <= 0 {
+			bail!("ストリーミング楽曲の FileType が不明です: {uri}");
+		}
 		self.insert_content(uri.to_string(), uri.to_string(), 0, file_type, "0".into(), extra)
+	}
+
+	fn ensure_new_folder_path(&self, folder_path: &str) -> Result<()> {
+		let exists: bool = self.conn.query_row(
+			"SELECT EXISTS(SELECT 1 FROM djmdContent WHERE FolderPath = ?1)",
+			[folder_path],
+			|r| r.get(0),
+		)?;
+		if exists {
+			bail!("同じパスの楽曲が既に登録されています: {folder_path}");
+		}
+		Ok(())
 	}
 
 	fn insert_content(
@@ -648,15 +666,6 @@ impl RekordboxDb {
 		file_id: String,
 		extra: Vec<(&'static str, Value)>,
 	) -> Result<String> {
-		let exists: bool = self.conn.query_row(
-			"SELECT EXISTS(SELECT 1 FROM djmdContent WHERE FolderPath = ?1)",
-			[&folder_path],
-			|r| r.get(0),
-		)?;
-		if exists {
-			bail!("同じパスの楽曲が既に登録されています: {folder_path}");
-		}
-
 		let id = self.generate_unused_id(Table::Content, "ID")?;
 		let content_link: Option<i64> = self
 			.conn

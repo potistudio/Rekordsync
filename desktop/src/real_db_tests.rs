@@ -84,6 +84,8 @@ fn read_matches_python() {
 		let got = got.as_object_mut().unwrap();
 		got.remove("key");
 		got.remove("color");
+		// Python 版はストリーミング楽曲の参照を出力しないため比較しない。
+		got.remove("stream");
 		assert_eq!(
 			Value::Object(got.clone()),
 			Value::Object(want.clone()),
@@ -262,7 +264,7 @@ fn stream_tracks_export_then_import_into_copy() {
 		.expect("ストリーミング楽曲を含むプレイリストがありません");
 
 	let exported = work.join("export.rsync");
-	let package = export_playlists(&db, &[selected.clone()], &exported, &Task::silent()).unwrap();
+	let package = export_playlists(&db, std::slice::from_ref(&selected), &exported, &Task::silent()).unwrap();
 	let streams: Vec<&TrackData> = package.tracks.iter().filter(|t| t.stream.is_some()).collect();
 	assert!(!streams.is_empty());
 	for t in &streams {
@@ -308,6 +310,12 @@ fn stream_tracks_export_then_import_into_copy() {
 			s.uri = format!("{}-rstest", s.uri);
 		}
 	});
+	// rename で作られる名前（`<名前> (n)` のうち未使用の最小の n）を取り込み前に求める。
+	let base = &package.playlists[0].name;
+	let created_name = (2..)
+		.map(|i| format!("{base} ({i})"))
+		.find(|n| db.find_playlist_by_name(n).unwrap().is_none())
+		.unwrap();
 	let r2 = import_package(&mut db, &new_pkg, &options, Some(&all), &Task::silent()).unwrap();
 	eprintln!("新規:\n{}\n{:?}", r2.summary(), r2.warnings);
 	assert!(r2.tracks_added >= streams.len());
@@ -317,7 +325,7 @@ fn stream_tracks_export_then_import_into_copy() {
 		r2.warnings
 	);
 	let created = db
-		.find_playlist_by_name(&format!("{} (3)", package.playlists[0].name))
+		.find_playlist_by_name(&created_name)
 		.unwrap()
 		.expect("取り込んだプレイリストがありません");
 	let members = db.playlist_content_ids(&created.id).unwrap();

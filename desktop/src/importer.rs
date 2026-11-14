@@ -190,9 +190,14 @@ fn import_track(
 		TrackSource::File(path) => db.find_content_by_path(path)?,
 		TrackSource::Stream(stream) => db.find_content_by_stream_uri(&stream.uri)?,
 	};
+	// UUID が一致してもファイルとストリーミングの種別が異なる行は別の楽曲として扱う。
+	// 再利用すると、取り込む解析データの PPTH と行の `FolderPath` の種別が食い違うため。
+	let is_stream = matches!(source, TrackSource::Stream(_));
 	let existing = match by_location {
 		Some(c) => Some(c),
-		None => db.find_content_by_uuid(&track.uuid)?,
+		None => db
+			.find_content_by_uuid(&track.uuid)?
+			.filter(|c| c.stream_uri().is_some() == is_stream),
 	};
 	let content = match existing {
 		Some(c) => {
